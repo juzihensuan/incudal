@@ -23,6 +23,8 @@ import { useAuthStore } from '@/stores/auth'
 import { useToast } from '@/stores/toast'
 import { useThemeStore } from '@/stores/theme'
 import { useConfigStore } from '@/stores/config'
+import { storeToRefs } from 'pinia'
+import { useInstanceResourcesStore } from '@/stores/instanceResources'
 import RegionSelector from '@/components/instance/RegionSelector.vue'
 import type { Region } from '@/components/instance/RegionSelector.vue'
 import PackageSelector from '@/components/instance/PackageSelector.vue'
@@ -33,7 +35,7 @@ import ImageSelector from '@/components/instance/ImageSelector.vue'
 import SSHKeySelector from '@/components/instance/SSHKeySelector.vue'
 import InitCommandSelector from '@/components/extensions/InitCommandSelector.vue'
 import UserAvatar from '@/components/UserAvatar.vue'
-import type { Package, UserQuota, SshKey, AvailableHost, CreateInstanceRequest } from '@/types/api'
+import type { Package, UserQuota, AvailableHost, CreateInstanceRequest } from '@/types/api'
 import { normalizePackageSourceQuery, toPackageSourceRequest, type PackageSource } from '@/utils/publicCatalog'
 import { validateName as validateInstanceName } from '@/utils/validation'
 import { translateError } from '@/utils/errorHandler'
@@ -86,6 +88,8 @@ const authStore = useAuthStore()
 const toast = useToast()
 const themeStore = useThemeStore()
 const configStore = useConfigStore()
+const resourcesStore = useInstanceResourcesStore()
+const { sshKeys, hostingZones } = storeToRefs(resourcesStore)
 
 // 右栏滚动容器 ref（选套餐后滚回顶部）
 const rightPanelScrollRef = ref<HTMLElement | null>(null)
@@ -93,7 +97,6 @@ const rightPanelScrollRef = ref<HTMLElement | null>(null)
 // 当前选中的套餐来源
 const packageSource = ref<PackageSource>('official')
 const sourceLoading = ref<boolean>(false)
-const hostingZones = ref<HostingZoneTab[]>([])
 
 // 数据加载状态
 // 地区选择
@@ -103,9 +106,11 @@ const regionsLoading = ref<boolean>(false)
 
 const packages = ref<Package[]>([])
 const userQuota = ref<UserQuota | null>(null)
-const sshKeys = ref<SshKey[]>([])
 const availableHosts = ref<AvailableHost[]>([])
 const availableImages = ref<ImageOption[]>([])
+// System images cache: key = `${hostId}:${instanceType}:${memory <= 128 ? 'low' : 'high'}`, TTL 120s
+const systemImageCache = new Map<string, { images: ImageOption[]; ts: number }>()
+const SYSTEM_IMAGE_TTL = 120_000
 const packagePlans = ref<PackagePlan[]>([])
 const imagesLoading = ref<boolean>(false)
 const hostsLoading = ref<boolean>(false)
@@ -452,44 +457,39 @@ const selectedHostingZone = computed<HostingZoneTab | null>(() => {
 })
 
 onMounted(async (): Promise<void> => {
-  await configStore.loadPublicConfig(true)
+  await configStore.loadPublicConfig()
 
   // 检查 URL 参数（分享链接）
   const packageParam = route.query.package as string | undefined
   const planParam = route.query.plan as string | undefined
   const targetPackageId = packageParam ? Number(packageParam) : null
   const targetPlanId = planParam ? Number(planParam) : null
-  
+
   // 确定初始加载的套餐来源
   const initialSource = normalizePackageSourceQuery(route.query.source, route.query.zoneId)
-  
+  const effectiveInitialSource = getSelectablePackageSource(initialSource)
+  const initialSourceRequest = toPackageSourceRequest(effectiveInitialSource)
+
   try {
-    const [zonesRes, userRes, keysRes] = await Promise.all([
-      configStore.hostingMarketEntryEnabled ? api.packages.getHostingZones() : Promise.resolve({ zones: [] as HostingZoneTab[] }),
+    // 合并为单个 Promise.all：5 个请求全部并行（initialSourceRequest 仅依赖 route.query，不依赖其他请求结果）
+    const [, userRes, , packagesRes, regionsRes] = await Promise.all([
+      configStore.hostingMarketEntryEnabled ? resourcesStore.loadHostingZones() : Promise.resolve(),
       api.users.get(authStore.user!.id),
-      api.sshKeys.list()
-    ])
-    hostingZones.value = configStore.hostingMarketEntryEnabled ? (zonesRes.zones || []) : []
-
-    const effectiveInitialSource = getSelectablePackageSource(initialSource)
-    const initialSourceRequest = toPackageSourceRequest(effectiveInitialSource)
-
-    const [packagesRes, regionsRes] = await Promise.all([
+      resourcesStore.loadSshKeys(),
       api.packages.list(initialSourceRequest),
       api.packages.getRegions(initialSourceRequest)
     ])
-    
+
     packages.value = ((packagesRes as { packages?: Package[] }).packages || []).filter(p => p.active === 1)
     const userData = userRes as { user?: { quota?: UserQuota } }
     userQuota.value = userData.user?.quota || null
-    sshKeys.value = keysRes.keys || []
     regions.value = regionsRes.regions || []
-    
+
     // 如果有 URL 参数指定的来源，更新状态
     if (effectiveInitialSource !== 'official') {
       packageSource.value = effectiveInitialSource as PackageSource
     }
-    
+
     // 处理分享链接参数：自动选择地区和套餐
     if (targetPackageId) {
       // 查找包含该套餐的地区
@@ -497,11 +497,11 @@ onMounted(async (): Promise<void> => {
       if (targetRegion) {
         selectedRegion.value = targetRegion.code
       }
-      
-      // 选择套餐
+
+      // 选择套餐（不阻塞 onMounted，让 UI 先渲染套餐列表）
       const targetPkg = packages.value.find(p => p.id === targetPackageId)
       if (targetPkg) {
-        await selectPackage(targetPkg, targetPlanId)
+        selectPackage(targetPkg, targetPlanId)
       } else {
         // 套餐不存在，提示用户并选择第一个
         toast.warning(t('instance.createPage.sharedPackageNotFound'))
@@ -515,7 +515,7 @@ onMounted(async (): Promise<void> => {
         selectPackage(filteredPackages.value[0])
       }
     }
-    
+
     if (sshKeys.value.length > 0) {
       form.value.sshKeyId = sshKeys.value[0].id
     }
@@ -625,8 +625,13 @@ async function selectPackage(pkg: Package, preferredPlanId?: number | null): Pro
   availableImages.value = []
   resetPromoCode()          // 重置优惠码状态
   
-  // 先加载套餐方案（这样才能正确判断是否是付费套餐）
-  await loadPackagePlans(pkg.id)
+  // 从列表响应中直接读取 plans（后端已附带），避免额外 API 请求
+  if (pkg.plans) {
+    packagePlans.value = pkg.plans
+  } else {
+    // 降级：后端未附带 plans 时仍走 API
+    await loadPackagePlans(pkg.id)
+  }
 
   if (packagePlans.value.length > 0 && preferredPlanId) {
     const matchedPlan = packagePlans.value.find(plan => plan.id === preferredPlanId)
@@ -660,27 +665,10 @@ async function selectPackage(pkg: Package, preferredPlanId?: number | null): Pro
     rightPanelScrollRef.value.scrollTop = 0
   }
   
-  // 加载套餐详情以获取quotaInfo（仅在套餐信息中还没有quotaInfo时加载）
+  // 非阻塞地加载配额信息（仅在套餐信息中还没有quotaInfo时加载）
   const currentPkg = packages.value.find(p => p.id === pkg.id)
   if (!currentPkg?.quotaInfo) {
-    try {
-      const detailRes = await api.packages.get(pkg.id) as any
-      const detailPkg = detailRes.package || detailRes
-      // 更新packages数组中的套餐信息，包含quotaInfo
-      const index = packages.value.findIndex(p => p.id === pkg.id)
-      if (index !== -1) {
-        packages.value[index] = { 
-          ...packages.value[index], 
-          quotaInfo: detailPkg.quotaInfo || null,
-          required_package_id: detailPkg.required_package_id ?? packages.value[index].required_package_id ?? null,
-          required_package_name: detailPkg.required_package_name ?? packages.value[index].required_package_name ?? null,
-          has_required_package_instance: detailPkg.has_required_package_instance ?? (packages.value[index] as any).has_required_package_instance ?? true
-        }
-      }
-    } catch (err) {
-      // 静默失败，不影响其他功能
-      console.warn('Failed to load package quota info:', err)
-    }
+    loadPackageQuotaInfo(pkg.id)
   }
   
   // 检查套餐是否绑定了宿主机
@@ -697,6 +685,29 @@ async function selectPackage(pkg: Package, preferredPlanId?: number | null): Pro
   }
   
   previousMemoryIsLow = form.value.memory <= 128
+}
+
+/**
+ * 非阻塞地加载套餐配额信息
+ */
+async function loadPackageQuotaInfo(packageId: number): Promise<void> {
+  try {
+    const detailRes = await api.packages.get(packageId) as any
+    const detailPkg = detailRes.package || detailRes
+    const index = packages.value.findIndex(p => p.id === packageId)
+    if (index !== -1) {
+      packages.value[index] = {
+        ...packages.value[index],
+        quotaInfo: detailPkg.quotaInfo || null,
+        required_package_id: detailPkg.required_package_id ?? packages.value[index].required_package_id ?? null,
+        required_package_name: detailPkg.required_package_name ?? packages.value[index].required_package_name ?? null,
+        has_required_package_instance: detailPkg.has_required_package_instance ?? (packages.value[index] as any).has_required_package_instance ?? true
+      }
+    }
+  } catch (err) {
+    // 静默失败，不影响其他功能
+    console.warn('Failed to load package quota info:', err)
+  }
 }
 
 /**
@@ -920,19 +931,39 @@ async function loadAvailableImages(instanceType?: 'container' | 'vm', memory?: n
     return
   }
 
+  // Check cache (keyed by host + instanceType + memory threshold)
+  const cacheKey = `${hostId}:${instanceType || 'unknown'}:${(memory || 0) <= 128 ? 'low' : 'high'}`
+  const cached = systemImageCache.get(cacheKey)
+  if (cached && Date.now() - cached.ts < SYSTEM_IMAGE_TTL) {
+    availableImages.value = cached.images
+    if (cached.images.length > 0) {
+      const currentExists = cached.images.some((img) => img.value === form.value.image)
+      if (!currentExists) {
+        form.value.image = cached.images[0].value
+      }
+    } else {
+      form.value.image = ''
+    }
+    return
+  }
+
   imagesLoading.value = true
   try {
     const res = await api.images.getSystemImages(instanceType, memory, hostId)
-    availableImages.value = (res.images || []).map(img => ({
+    const images = (res.images || []).map(img => ({
       value: img.remoteAlias,
       label: img.name,
       icon: img.icon || getDistroFromName(img.name)
     }))
-    
-    if (availableImages.value.length > 0) {
-      const currentExists = availableImages.value.some((img) => img.value === form.value.image)
+
+    // Cache the result
+    systemImageCache.set(cacheKey, { images, ts: Date.now() })
+
+    availableImages.value = images
+    if (images.length > 0) {
+      const currentExists = images.some((img) => img.value === form.value.image)
       if (!currentExists) {
-        form.value.image = availableImages.value[0].value
+        form.value.image = images[0].value
       }
     } else {
       form.value.image = ''

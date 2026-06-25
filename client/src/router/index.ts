@@ -2,6 +2,7 @@ import { createRouter, createWebHistory } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { useConfigStore } from '@/stores/config'
 import { useInstanceStore } from '@/stores/instance'
+import { useInstanceResourcesStore } from '@/stores/instanceResources'
 import type { RouteLocationNormalized, NavigationGuardNext, RouteRecordRaw } from 'vue-router'
 import api, { cancelAllPendingRequests } from '@/api'
 
@@ -125,7 +126,24 @@ const routes: RouteRecordRaw[] = [
     path: '/instances/create',
     name: 'instance-create',
     component: () => import('@/views/InstanceCreateView.vue'),
-    meta: { requiresAuth: true, titleKey: 'nav.createInstance', title: '创建实例' }
+    meta: {
+      requiresAuth: true,
+      titleKey: 'nav.createInstance',
+      title: '创建实例',
+      prefetch: () => {
+        const authStore = useAuthStore()
+        const configStore = useConfigStore()
+        const resourcesStore = useInstanceResourcesStore()
+        configStore.loadPublicConfig()
+        Promise.all([
+          api.packages.list({ source: 'official' }),
+          api.packages.getRegions({ source: 'official' }),
+          api.users.get(authStore.user!.id),
+          resourcesStore.loadSshKeys(),
+          configStore.hostingMarketEntryEnabled ? resourcesStore.loadHostingZones() : Promise.resolve()
+        ]).catch(() => {})
+      }
+    }
   },
   {
     path: '/instances/:id',
@@ -631,6 +649,7 @@ router.isReady().then(() => {
   setTimeout(() => {
     prefetchRoute('dashboard')
     prefetchRoute('instances')
+    prefetchRoute('instance-create')
     prefetchRoute('instance-detail')
     prefetchRoute('profile')
   }, 2000)

@@ -1043,6 +1043,8 @@ export interface Package {
   // 实例操作权限
   allow_instance_deletion?: boolean  // 是否允许用户删除实例
   sharedAt?: string  // 共享时间（共享套餐）
+  // 套餐方案列表（列表响应中附带，避免前端额外请求）
+  plans?: PackagePlan[]
   // 剩余配额信息
   quotaInfo?: {
     maxInstances: number | null
